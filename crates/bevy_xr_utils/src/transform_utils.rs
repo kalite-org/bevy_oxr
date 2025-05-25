@@ -36,7 +36,6 @@ pub fn handle_transform_events(
                 Some(view) => {
                     //we want the view translation with a height of zero for a few calculations
                     let mut view_translation = view.pose.position.to_vec3();
-                    view_translation.y = 0.0;
 
                     //position
                     for position in position_reader.read() {
