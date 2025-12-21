@@ -1,16 +1,27 @@
-use std::{mem::MaybeUninit, ptr, sync::Mutex};
-
-use bevy::{platform::collections::hash_set::HashSet, prelude::*};
+use bevy_app::{App, Plugin, PreUpdate, Startup};
+use bevy_ecs::{
+    component::Component,
+    message::MessageReader,
+    schedule::IntoScheduleConfigs as _,
+    system::{Query, Res, ResMut},
+};
+use bevy_log::warn;
+use bevy_log::{error, info};
+use bevy_math::Isometry3d;
 use bevy_mod_xr::{
     session::{XrFirst, XrHandleEvents},
     spaces::{
-        XrDestroySpace, XrPrimaryReferenceSpace, XrReferenceSpace, XrSpace, XrSpaceLocationFlags, XrSpaceSyncSet, XrSpaceVelocityFlags, XrVelocity
+        XrDestroySpace, XrPrimaryReferenceSpace, XrReferenceSpace, XrSpace, XrSpaceLocationFlags,
+        XrSpaceSyncSet, XrSpaceVelocityFlags, XrVelocity,
     },
 };
+use bevy_platform::collections::hash_set::HashSet;
+use bevy_transform::components::Transform;
 use openxr::{
-    sys, HandJointLocation, HandJointLocations, HandJointVelocities, HandJointVelocity,
-    ReferenceSpaceType, SpaceLocationFlags, SpaceVelocityFlags, HAND_JOINT_COUNT,
+    HAND_JOINT_COUNT, HandJointLocation, HandJointLocations, HandJointVelocities,
+    HandJointVelocity, ReferenceSpaceType, SpaceLocationFlags, SpaceVelocityFlags, sys,
 };
+use std::{mem::MaybeUninit, ptr, sync::Mutex};
 
 use crate::{
     helper_traits::{ToPosef, ToQuat, ToVec3},
@@ -33,7 +44,7 @@ impl Plugin for OxrSpacePatchingPlugin {
 pub struct OxrSpatialPlugin;
 impl Plugin for OxrSpatialPlugin {
     fn build(&self, app: &mut App) {
-        app.add_event::<XrDestroySpace>()
+        app.add_message::<XrDestroySpace>()
             .add_systems(
                 XrFirst,
                 destroy_space_event
@@ -51,7 +62,7 @@ impl Plugin for OxrSpatialPlugin {
     }
 }
 
-fn destroy_space_event(instance: Res<OxrInstance>, mut events: EventReader<XrDestroySpace>) {
+fn destroy_space_event(instance: Res<OxrInstance>, mut events: MessageReader<XrDestroySpace>) {
     for space in events.read() {
         match instance.destroy_space(space.0) {
             Ok(_) => (),
@@ -87,10 +98,12 @@ unsafe extern "system" fn patched_destroy_space(space: openxr::sys::Space) -> op
         .unwrap()
         .contains(&space.into_raw())
     {
-        OXR_ORIGINAL_DESTOY_SPACE
-            .lock()
-            .unwrap()
-            .expect("has to be initialized")(space)
+        unsafe {
+            OXR_ORIGINAL_DESTOY_SPACE
+                .lock()
+                .unwrap()
+                .expect("has to be initialized")(space)
+        }
     } else {
         info!("Inject Worked, not destroying space");
         openxr::sys::Result::SUCCESS
@@ -231,7 +244,7 @@ impl OxrSession {
     pub fn create_reference_space(
         &self,
         ref_space_type: ReferenceSpaceType,
-        pose_in_ref_space: Transform,
+        pose_in_ref_space: Isometry3d,
     ) -> openxr::Result<XrReferenceSpace> {
         let info = sys::ReferenceSpaceCreateInfo {
             ty: sys::ReferenceSpaceCreateInfo::TYPE,
@@ -573,12 +586,9 @@ unsafe impl OxrSpaceExt for XrSpace {
 }
 
 fn cvt(x: sys::Result) -> openxr::Result<sys::Result> {
-    if x.into_raw() >= 0 {
-        Ok(x)
-    } else {
-        Err(x)
-    }
+    if x.into_raw() >= 0 { Ok(x) } else { Err(x) }
 }
+#[allow(clippy::obfuscated_if_else)]
 unsafe fn create_view(flags: openxr::ViewStateFlags, raw: &MaybeUninit<sys::View>) -> openxr::View {
     // Applications *must* not read invalid parts of a poses, i.e. they may be uninitialized
     let ptr = raw.as_ptr();
@@ -586,47 +596,49 @@ unsafe fn create_view(flags: openxr::ViewStateFlags, raw: &MaybeUninit<sys::View
         pose: openxr::Posef {
             orientation: flags
                 .contains(sys::ViewStateFlags::ORIENTATION_VALID)
-                .then(|| *ptr::addr_of!((*ptr).pose.orientation))
+                .then(|| unsafe { *ptr::addr_of!((*ptr).pose.orientation) })
                 .unwrap_or_default(),
             position: flags
                 .contains(sys::ViewStateFlags::POSITION_VALID)
-                .then(|| *ptr::addr_of!((*ptr).pose.position))
+                .then(|| unsafe { *ptr::addr_of!((*ptr).pose.position) })
                 .unwrap_or_default(),
         },
-        fov: *ptr::addr_of!((*ptr).fov),
+        fov: unsafe { *ptr::addr_of!((*ptr).fov) },
     }
 }
+#[allow(clippy::obfuscated_if_else)]
 unsafe fn create_space_location(raw: &MaybeUninit<sys::SpaceLocation>) -> openxr::SpaceLocation {
     // Applications *must* not read invalid parts of a pose, i.e. they may be uninitialized
     let ptr = raw.as_ptr();
-    let flags = *ptr::addr_of!((*ptr).location_flags);
+    let flags = unsafe { *ptr::addr_of!((*ptr).location_flags) };
     openxr::SpaceLocation {
         location_flags: flags,
         pose: openxr::Posef {
             orientation: flags
                 .contains(sys::SpaceLocationFlags::ORIENTATION_VALID)
-                .then(|| *ptr::addr_of!((*ptr).pose.orientation))
+                .then(|| unsafe { *ptr::addr_of!((*ptr).pose.orientation) })
                 .unwrap_or_default(),
             position: flags
                 .contains(sys::SpaceLocationFlags::POSITION_VALID)
-                .then(|| *ptr::addr_of!((*ptr).pose.position))
+                .then(|| unsafe { *ptr::addr_of!((*ptr).pose.position) })
                 .unwrap_or_default(),
         },
     }
 }
+#[allow(clippy::obfuscated_if_else)]
 unsafe fn create_space_velocity(raw: &MaybeUninit<sys::SpaceVelocity>) -> openxr::SpaceVelocity {
     // Applications *must* not read invalid velocities, i.e. they may be uninitialized
     let ptr = raw.as_ptr();
-    let flags = *ptr::addr_of!((*ptr).velocity_flags);
+    let flags = unsafe { *ptr::addr_of!((*ptr).velocity_flags) };
     openxr::SpaceVelocity {
         velocity_flags: flags,
         linear_velocity: flags
             .contains(sys::SpaceVelocityFlags::LINEAR_VALID)
-            .then(|| *ptr::addr_of!((*ptr).linear_velocity))
+            .then(|| unsafe { *ptr::addr_of!((*ptr).linear_velocity) })
             .unwrap_or_default(),
         angular_velocity: flags
             .contains(sys::SpaceVelocityFlags::ANGULAR_VALID)
-            .then(|| *ptr::addr_of!((*ptr).angular_velocity))
+            .then(|| unsafe { *ptr::addr_of!((*ptr).angular_velocity) })
             .unwrap_or_default(),
     }
 }

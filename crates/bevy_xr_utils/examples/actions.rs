@@ -2,9 +2,8 @@
 use bevy::{math::vec3, prelude::*};
 use bevy_mod_openxr::{add_xr_plugins, helper_traits::ToQuat, resources::OxrViews};
 use bevy_mod_xr::session::XrTrackingRoot;
-use bevy_xr_utils::xr_utils_actions::{
-    ActiveSet, XRUtilsAction, XRUtilsActionSet, XRUtilsActionState, XRUtilsActionSystemSet,
-    XRUtilsActionsPlugin, XRUtilsBinding,
+use bevy_xr_utils::actions::{
+    ActionType, ActiveSet, XRUtilsAction, XRUtilsActionSet, XRUtilsActionState, XRUtilsActionSystems, XRUtilsActionsPlugin, XRUtilsBinding
 };
 
 fn main() {
@@ -14,7 +13,7 @@ fn main() {
         .add_systems(Startup, setup_scene)
         .add_systems(
             Startup,
-            create_action_entities.before(XRUtilsActionSystemSet::CreateEvents),
+            create_action_entities.before(XRUtilsActionSystems::CreateEvents),
         )
         .add_plugins(XRUtilsActionsPlugin)
         .add_systems(Update, read_action_with_marker_component)
@@ -73,7 +72,7 @@ fn create_action_entities(mut commands: Commands) {
             XRUtilsAction {
                 action_name: "flight_input".into(),
                 localized_name: "flight_input_localized".into(),
-                action_type: bevy_mod_xr::actions::ActionType::Vector,
+                action_type: ActionType::Vector,
             },
             FlightActionMarker, //lets try a marker component
         ))

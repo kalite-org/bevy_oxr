@@ -1,26 +1,36 @@
-use bevy::{
-    prelude::*,
-    render::{
-        camera::{ManualTextureView, ManualTextureViewHandle, ManualTextureViews, RenderTarget},
-        extract_resource::ExtractResourcePlugin,
-        pipelined_rendering::PipelinedRenderingPlugin,
-        view::{ExtractedView, NoFrustumCulling},
-        Render, RenderApp,
-    },
-    transform::TransformSystem,
+use bevy_app::{App, Plugin, PostUpdate};
+use bevy_camera::{Camera, ManualTextureViewHandle, Projection, RenderTarget};
+use bevy_ecs::{
+    change_detection::DetectChanges as _,
+    entity::Entity,
+    schedule::{IntoScheduleConfigs as _, SystemSet},
+    system::{Commands, Query, Res, ResMut},
+    world::World,
 };
+use bevy_log::{debug_span, error, info};
+use bevy_render::{
+    extract_resource::ExtractResourcePlugin,
+    pipelined_rendering::PipelinedRenderingPlugin,
+    texture::{ManualTextureView, ManualTextureViews},
+    view::ExtractedView,
+    Render, RenderApp,
+};
+
 use bevy_mod_xr::{
     camera::{calculate_projection, Fov, XrCamera, XrProjection, XrViewInit},
     session::{
-        XrFirst, XrHandleEvents, XrPreDestroySession, XrRenderSet, XrRootTransform,
+        XrFirst, XrHandleEvents, XrPreDestroySession, XrRenderSystems, XrRootTransform,
         XrSessionCreated,
     },
     spaces::XrPrimaryReferenceSpace,
 };
+use bevy_transform::{components::Transform, TransformSystems};
 use openxr::ViewStateFlags;
 
-use crate::{init::should_run_frame_loop, resources::*};
+use crate::{helper_traits::ToTransform as _, init::should_run_frame_loop, resources::*};
 use crate::{layer_builder::ProjectionLayer, session::OxrSession};
+
+use super::environment_blend_mode::OxrEnvironmentBlendModes;
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, SystemSet)]
 pub struct OxrRenderBegin;
@@ -30,15 +40,20 @@ pub struct OxrRenderEnd;
 
 pub struct OxrRenderPlugin {
     pub spawn_cameras: bool,
+    pub default_wait_frame: bool,
 }
 
 impl Default for OxrRenderPlugin {
     fn default() -> Self {
         Self {
             spawn_cameras: true,
+            default_wait_frame: true,
         }
     }
 }
+
+#[derive(SystemSet, Debug, Hash, PartialEq, Eq, Clone, Copy)]
+pub struct OxrWaitFrameSystem;
 
 impl Plugin for OxrRenderPlugin {
     fn build(&self, app: &mut App) {
@@ -52,14 +67,21 @@ impl Plugin for OxrRenderPlugin {
             ExtractResourcePlugin::<OxrSwapchainImages>::default(),
             ExtractResourcePlugin::<OxrViews>::default(),
         ))
-        .add_systems(XrPreDestroySession, clean_views)
-        .add_systems(
+        .add_systems(XrPreDestroySession, clean_views);
+        if self.default_wait_frame {
+            app.add_systems(
+                XrFirst,
+                wait_frame
+                    .run_if(should_run_frame_loop)
+                    .in_set(OxrWaitFrameSystem)
+                    .in_set(XrHandleEvents::FrameLoop),
+            );
+        }
+        app.add_systems(
             XrFirst,
-            (
-                wait_frame.run_if(should_run_frame_loop),
-                update_cameras.run_if(should_run_frame_loop),
-            )
-                .chain()
+            update_cameras
+                .run_if(should_run_frame_loop)
+                .after(OxrWaitFrameSystem)
                 .in_set(XrHandleEvents::FrameLoop),
         )
         .add_systems(
@@ -74,9 +96,8 @@ impl Plugin for OxrRenderPlugin {
         .add_systems(
             PostUpdate,
             (locate_views, update_views)
-                .before(TransformSystem::TransformPropagate)
+                .before(TransformSystems::Propagate)
                 .chain()
-                // .run_if(should_render)
                 .run_if(should_run_frame_loop),
         )
         .init_resource::<OxrViews>();
@@ -95,7 +116,7 @@ impl Plugin for OxrRenderPlugin {
                     wait_image,
                 )
                     .chain()
-                    .in_set(XrRenderSet::PreRender)
+                    .in_set(XrRenderSystems::PreRender)
                     .run_if(should_run_frame_loop),
             )
             .add_systems(
@@ -103,39 +124,11 @@ impl Plugin for OxrRenderPlugin {
                 (release_image, end_frame)
                     .chain()
                     .run_if(should_run_frame_loop)
-                    .in_set(XrRenderSet::PostRender),
+                    .in_set(XrRenderSystems::PostRender),
             )
             .insert_resource(OxrRenderLayers(vec![Box::new(ProjectionLayer)]));
     }
 }
-
-// fn update_rendering(app_world: &mut World, _sub_app: &mut App) {
-//     app_world.resource_scope(|world, main_thread_executor: Mut<MainThreadExecutor>| {
-//         world.resource_scope(|world, mut render_channels: Mut<RenderAppChannels>| {
-//             // we use a scope here to run any main thread tasks that the render world still needs to run
-//             // while we wait for the render world to be received.
-//             let mut render_app = ComputeTaskPool::get()
-//                 .scope_with_executor(true, Some(&*main_thread_executor.0), |s| {
-//                     s.spawn(async { render_channels.recv().await });
-//                 })
-//                 .pop()
-//                 .unwrap();
-
-//             if matches!(world.resource::<XrState>(), XrState::Stopping) {
-//                 world.run_schedule(XrEndSession);
-//             }
-
-//             if matches!(world.resource::<XrState>(), XrState::Exiting { .. }) {
-//                 world.run_schedule(XrDestroySession);
-//                 render_app.app.world.run_schedule(XrDestroySession);
-//             }
-
-//             render_app.extract(world);
-
-//             render_channels.send_blocking(render_app);
-//         });
-//     });
-// }
 
 pub const XR_TEXTURE_INDEX: u32 = 3383858418;
 
@@ -171,7 +164,7 @@ pub fn init_views<const SPAWN_CAMERAS: bool>(
                 },
                 XrCamera(index),
                 Projection::custom(XrProjection::default()),
-                NoFrustumCulling,
+                // NoFrustumCulling,
             ));
         }
     }
@@ -269,12 +262,7 @@ pub fn update_views(
         );
         projection.projection_matrix = projection_matrix;
 
-        let openxr::Quaternionf { x, y, z, w } = view.pose.orientation;
-        let rotation = Quat::from_xyzw(x, y, z, w);
-        transform.rotation = rotation;
-        let openxr::Vector3f { x, y, z } = view.pose.position;
-        let translation = Vec3::new(x, y, z);
-        transform.translation = translation;
+        *transform = view.pose.to_transform();
     }
 }
 
@@ -287,14 +275,7 @@ pub fn update_views_render_world(
         let Some(view) = views.get(camera.0 as usize) else {
             continue;
         };
-        let mut transform = Transform::IDENTITY;
-        let openxr::Quaternionf { x, y, z, w } = view.pose.orientation;
-        let rotation = Quat::from_xyzw(x, y, z, w);
-        transform.rotation = rotation;
-        let openxr::Vector3f { x, y, z } = view.pose.position;
-        let translation = Vec3::new(x, y, z);
-        transform.translation = translation;
-        extracted_view.world_from_view = root.0.mul_transform(transform);
+        extracted_view.world_from_view = root.0.mul_transform(view.pose.to_transform());
     }
 }
 
@@ -331,7 +312,7 @@ pub fn add_texture_view(
         dimension: Some(wgpu::TextureViewDimension::D2),
         array_layer_count: Some(1),
         base_array_layer: index,
-        ..default()
+        ..Default::default()
     });
     let view = ManualTextureView {
         texture_view: view.into(),
@@ -381,7 +362,7 @@ pub fn end_frame(world: &mut World) {
         let _span = debug_span!("xr_end_frame").entered();
         if let Err(e) = frame_stream.end(
             frame_state.predicted_display_time,
-            world.resource::<OxrCurrentSessionConfig>().blend_mode,
+            world.resource::<OxrEnvironmentBlendModes>().blend_mode(),
             &layers,
         ) {
             error!("Failed to end frame stream: {e}");

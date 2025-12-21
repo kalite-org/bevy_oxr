@@ -1,5 +1,8 @@
-use bevy::prelude::*;
-use bevy::render::extract_resource::ExtractResource;
+use bevy_derive::{Deref, DerefMut};
+use bevy_ecs::resource::Resource;
+use bevy_log::error;
+use bevy_math::UVec2;
+use bevy_render::extract_resource::ExtractResource;
 
 use crate::error::OxrError;
 use crate::graphics::*;
@@ -106,11 +109,12 @@ impl OxrInstance {
     pub fn init_graphics(
         &self,
         system_id: openxr::SystemId,
+        manual_config: Option<&OxrManualGraphicsConfig>,
     ) -> OxrResult<(WgpuGraphics, SessionGraphicsCreateInfo)> {
         graphics_match!(
             self.1;
             _ => {
-                let (graphics, session_info) = Api::init_graphics(&self.2, self, system_id)?;
+                let (graphics, session_info) = Api::init_graphics(&self.2, self, system_id, manual_config)?;
 
                 Ok((graphics, SessionGraphicsCreateInfo(Api::wrap(session_info))))
             }
@@ -140,7 +144,7 @@ impl OxrInstance {
         graphics_match!(
             info.0;
             info => {
-                let (session, frame_waiter, frame_stream) = Api::create_session(self,system_id, &info,chain)?;
+                let (session, frame_waiter, frame_stream) = unsafe { Api::create_session(self,system_id, &info,chain)? };
                 Ok((session.into(), OxrFrameWaiter(frame_waiter), OxrFrameStream(Api::wrap(frame_stream))))
             }
         )
@@ -188,15 +192,14 @@ impl OxrFrameStream {
                 let mut new_layers = vec![];
 
                 for (i, layer) in layers.iter().enumerate() {
-                    if let Some(swapchain) = layer.swapchain() {
-                        if !swapchain.0.using_graphics::<Api>() {
-                            error!(
-                                "Composition layer {i} is using graphics api '{}', expected graphics api '{}'. Excluding layer from frame submission.",
-                                swapchain.0.graphics_name(),
-                                std::any::type_name::<Api>(),
-                            );
-                            continue;
-                        }
+                    if let Some(swapchain) = layer.swapchain()
+                        && !swapchain.0.using_graphics::<Api>() {
+                        error!(
+                            "Composition layer {i} is using graphics api '{}', expected graphics api '{}'. Excluding layer from frame submission.",
+                            swapchain.0.graphics_name(),
+                            std::any::type_name::<Api>(),
+                        );
+                        continue;
                     }
                     new_layers.push(unsafe {
                         #[allow(clippy::missing_transmute_annotations)]
@@ -331,7 +334,6 @@ pub struct OxrRenderLayers(pub Vec<Box<dyn LayerProvider + Send + Sync>>);
 /// Resource storing graphics info for the currently running session.
 #[derive(Clone, Copy, Resource, ExtractResource)]
 pub struct OxrCurrentSessionConfig {
-    pub blend_mode: EnvironmentBlendMode,
     pub resolution: UVec2,
     pub format: wgpu::TextureFormat,
 }
@@ -340,7 +342,7 @@ pub struct OxrCurrentSessionConfig {
 /// This is used to store information from startup that is needed to create the session after the instance has been created.
 pub struct OxrSessionConfig {
     /// List of blend modes the openxr session can use. If [None], pick the first available blend mode.
-    pub blend_modes: Option<Vec<EnvironmentBlendMode>>,
+    pub blend_mode_preference: Vec<EnvironmentBlendMode>,
     /// List of formats the openxr session can use. If [None], pick the first available format
     pub formats: Option<Vec<wgpu::TextureFormat>>,
     /// List of resolutions that the openxr swapchain can use. If [None] pick the first available resolution.
@@ -349,9 +351,9 @@ pub struct OxrSessionConfig {
 impl Default for OxrSessionConfig {
     fn default() -> Self {
         Self {
-            blend_modes: Some(vec![openxr::EnvironmentBlendMode::OPAQUE]),
+            blend_mode_preference: vec![openxr::EnvironmentBlendMode::OPAQUE],
             formats: Some(vec![wgpu::TextureFormat::Rgba8UnormSrgb]),
-            resolutions: default(),
+            resolutions: None,
         }
     }
 }

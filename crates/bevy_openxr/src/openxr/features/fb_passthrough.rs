@@ -1,7 +1,14 @@
-use bevy::prelude::*;
-use bevy::render::Render;
-use bevy::render::RenderApp;
-use bevy::render::RenderSet;
+use bevy_app::App;
+use bevy_app::Plugin;
+use bevy_ecs::schedule::IntoScheduleConfigs as _;
+use bevy_ecs::schedule::common_conditions::resource_added;
+use bevy_ecs::system::Res;
+use bevy_ecs::world::World;
+use bevy_log::error;
+use bevy_log::info;
+use bevy_render::Render;
+use bevy_render::RenderApp;
+use bevy_render::RenderSystems;
 use openxr::sys::SystemPassthroughProperties2FB;
 use openxr::PassthroughCapabilityFlagsFB;
 
@@ -11,9 +18,9 @@ use crate::resources::*;
 use crate::session::OxrSession;
 use crate::types::Result as OxrResult;
 
-pub struct OxrPassthroughPlugin;
+pub struct OxrFbPassthroughPlugin;
 
-impl Plugin for OxrPassthroughPlugin {
+impl Plugin for OxrFbPassthroughPlugin {
     fn build(&self, app: &mut App) {
         if app
             .world()
@@ -34,7 +41,7 @@ impl Plugin for OxrPassthroughPlugin {
                 app.sub_app_mut(RenderApp).add_systems(
                     Render,
                     insert_passthrough
-                        .in_set(RenderSet::PrepareAssets)
+                        .in_set(RenderSystems::PrepareAssets)
                         .run_if(resource_added::<OxrSession>),
                 );
             } else {
@@ -94,23 +101,23 @@ pub fn supports_passthrough(instance: &OxrInstance, system: OxrSystemId) -> OxrR
         return Ok(false);
     }
     unsafe {
-        let mut hand = openxr::sys::SystemPassthroughProperties2FB {
+        let mut properties = openxr::sys::SystemPassthroughProperties2FB {
             ty: SystemPassthroughProperties2FB::TYPE,
             next: std::ptr::null(),
             capabilities: PassthroughCapabilityFlagsFB::PASSTHROUGH_CAPABILITY,
         };
-        let mut p = openxr::sys::SystemProperties::out(&mut hand as *mut _ as _);
+        let mut p = openxr::sys::SystemProperties::out(&mut properties as *mut _ as _);
         cvt((instance.fp().get_system_properties)(
             instance.as_raw(),
             system.0,
             p.as_mut_ptr(),
         ))?;
-        bevy::log::info!(
+        info!(
             "From supports_passthrough: Passthrough capabilities: {:?}",
-            hand.capabilities
+            properties.capabilities
         );
         Ok(
-            (hand.capabilities & PassthroughCapabilityFlagsFB::PASSTHROUGH_CAPABILITY)
+            (properties.capabilities & PassthroughCapabilityFlagsFB::PASSTHROUGH_CAPABILITY)
                 == PassthroughCapabilityFlagsFB::PASSTHROUGH_CAPABILITY,
         )
     }

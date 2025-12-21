@@ -1,24 +1,45 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
-use bevy::prelude::*;
-use bevy::render::extract_resource::ExtractResourcePlugin;
-use bevy::render::renderer::RenderAdapter;
-use bevy::render::renderer::RenderAdapterInfo;
-use bevy::render::renderer::RenderDevice;
-use bevy::render::renderer::RenderInstance;
-use bevy::render::renderer::RenderQueue;
-use bevy::render::renderer::WgpuWrapper;
-use bevy::render::settings::RenderCreation;
-use bevy::render::MainWorld;
-use bevy::render::Render;
-use bevy::render::RenderApp;
-use bevy::render::RenderDebugFlags;
-use bevy::render::RenderPlugin;
-use bevy::winit::UpdateMode;
-use bevy::winit::WinitSettings;
+use bevy_app::App;
+use bevy_app::Plugin;
+use bevy_ecs::message::MessageWriter;
+use bevy_ecs::message::Messages;
+use bevy_ecs::resource::Resource;
+use bevy_ecs::schedule::IntoScheduleConfigs as _;
+use bevy_ecs::schedule::SystemCondition as _;
+use bevy_ecs::schedule::common_conditions::on_message;
+use bevy_ecs::schedule::common_conditions::resource_exists;
+use bevy_ecs::system::Commands;
+use bevy_ecs::system::Local;
+use bevy_ecs::system::Res;
+use bevy_ecs::system::ResMut;
+use bevy_ecs::world::World;
+use bevy_log::debug;
+use bevy_log::debug_span;
+use bevy_log::error;
+use bevy_log::info;
+use bevy_log::warn;
+use bevy_math::UVec2;
 use bevy_mod_xr::session::*;
-use openxr::Event;
+use bevy_render::ExtractSchedule;
+use bevy_render::MainWorld;
+use bevy_render::Render;
+use bevy_render::RenderApp;
+use bevy_render::RenderDebugFlags;
+use bevy_render::RenderPlugin;
+use bevy_render::extract_resource::ExtractResourcePlugin;
+use bevy_render::renderer::RenderAdapter;
+use bevy_render::renderer::RenderAdapterInfo;
+use bevy_render::renderer::RenderDevice;
+use bevy_render::renderer::RenderInstance;
+use bevy_render::renderer::RenderQueue;
+use bevy_render::renderer::WgpuWrapper;
+use bevy_render::settings::RenderCreation;
+#[cfg(feature = "window_support")]
+use bevy_winit::UpdateMode;
+#[cfg(feature = "window_support")]
+use bevy_winit::WinitSettings;
 
 use crate::error::OxrError;
 use crate::graphics::*;
@@ -28,6 +49,7 @@ use crate::session::OxrSessionCreateNextChain;
 use crate::types::Result as OxrResult;
 use crate::types::*;
 
+use super::environment_blend_mode::OxrEnvironmentBlendModes;
 use super::exts::OxrEnabledExtensions;
 use super::poll_events::OxrEventHandlerExt;
 use super::poll_events::OxrEventIn;
@@ -63,25 +85,24 @@ pub struct OxrInitPlugin {
 impl Default for OxrInitPlugin {
     fn default() -> Self {
         Self {
-            app_info: default(),
+            app_info: Default::default(),
             exts: {
                 let mut exts = OxrExtensions::default();
-                exts.enable_fb_passthrough();
                 exts.enable_hand_tracking();
                 exts
             },
-            backends: default(),
+            backends: Default::default(),
             synchronous_pipeline_compilation: false,
-            render_debug_flags: default(),
+            render_debug_flags: Default::default(),
         }
     }
 }
 
 impl Plugin for OxrInitPlugin {
     fn build(&self, app: &mut App) {
-        app.add_event::<OxrInteractionProfileChanged>();
         app.init_resource::<OxrSessionConfig>();
-        match self.init_xr() {
+        let cfg = app.world_mut().remove_resource::<OxrManualGraphicsConfig>();
+        match self.init_xr(cfg.as_ref()) {
             Ok((
                 instance,
                 system_id,
@@ -103,6 +124,7 @@ impl Plugin for OxrInitPlugin {
                             debug_flags: self.render_debug_flags,
                         },
                         ExtractResourcePlugin::<OxrSessionStarted>::default(),
+                        ExtractResourcePlugin::<OxrEnvironmentBlendModes>::default(),
                     ))
                     .add_oxr_event_handler(handle_events)
                     .add_systems(
@@ -110,7 +132,7 @@ impl Plugin for OxrInitPlugin {
                         (
                             create_xr_session
                                 .run_if(state_equals(XrState::Available))
-                                .run_if(on_event::<XrCreateSessionEvent>),
+                                .run_if(on_message::<XrCreateSessionMessage>),
                             (
                                 destroy_xr_session,
                                 (|v: Res<XrDestroySessionRender>| {
@@ -120,16 +142,16 @@ impl Plugin for OxrInitPlugin {
                             )
                                 .chain()
                                 .run_if(state_matches!(XrState::Exiting { .. }))
-                                .run_if(on_event::<XrDestroySessionEvent>),
+                                .run_if(on_message::<XrDestroySessionMessage>),
                             begin_xr_session
                                 .run_if(state_equals(XrState::Ready))
-                                .run_if(on_event::<XrBeginSessionEvent>),
+                                .run_if(on_message::<XrBeginSessionMessage>),
                             end_xr_session
                                 .run_if(state_equals(XrState::Stopping))
-                                .run_if(on_event::<XrEndSessionEvent>),
+                                .run_if(on_message::<XrEndSessionMessage>),
                             request_exit_xr_session
                                 .run_if(session_created)
-                                .run_if(on_event::<XrRequestExitEvent>),
+                                .run_if(on_message::<XrRequestExitMessage>),
                             detect_session_destroyed,
                         )
                             .in_set(XrHandleEvents::SessionStateUpdateEvents),
@@ -137,17 +159,20 @@ impl Plugin for OxrInitPlugin {
                     .insert_resource(instance.clone())
                     .insert_resource(system_id)
                     .insert_resource(XrState::Available)
-                    .insert_resource(WinitSettings {
-                        focused_mode: UpdateMode::Continuous,
-                        unfocused_mode: UpdateMode::Continuous,
-                    })
                     .insert_resource(OxrSessionStarted(false))
                     .insert_non_send_resource(graphics_info)
                     .init_non_send_resource::<OxrSessionCreateNextChain>();
+                #[cfg(feature = "window_support")]
+                {
+                    app.insert_resource(WinitSettings {
+                        focused_mode: UpdateMode::Continuous,
+                        unfocused_mode: UpdateMode::Continuous,
+                    });
+                };
 
                 app.world_mut()
-                    .resource_mut::<Events<XrStateChanged>>()
-                    .send(XrStateChanged(XrState::Available));
+                    .resource_mut::<Messages<XrStateChanged>>()
+                    .write(XrStateChanged(XrState::Available));
 
                 let render_app = app.sub_app_mut(RenderApp);
 
@@ -160,6 +185,30 @@ impl Plugin for OxrInitPlugin {
             }
             Err(e) => {
                 error!("Failed to initialize openxr: {e}");
+                if let Some(cfg) = cfg
+                    && let Ok(WgpuGraphics(device, queue, adapter_info, adapter, wgpu_instance)) =
+                        graphics_match!(
+                            cfg.fallback_backend;
+                            _ => Api::init_fallback_graphics(&self.app_info ,&cfg)
+                        )
+                        .inspect_err(|err| {
+                            error!("Failed to initialize custom fallback graphics: {err}")
+                        })
+                {
+                    app.add_plugins(RenderPlugin {
+                        render_creation: RenderCreation::manual(
+                            device.into(),
+                            RenderQueue(Arc::new(WgpuWrapper::new(queue))),
+                            RenderAdapterInfo(WgpuWrapper::new(adapter_info)),
+                            RenderAdapter(Arc::new(WgpuWrapper::new(adapter))),
+                            RenderInstance(Arc::new(WgpuWrapper::new(wgpu_instance))),
+                        ),
+                        synchronous_pipeline_compilation: self.synchronous_pipeline_compilation,
+                        debug_flags: self.render_debug_flags,
+                    })
+                    .insert_resource(XrState::Unavailable);
+                    return;
+                }
                 app.add_plugins(RenderPlugin::default())
                     .insert_resource(XrState::Unavailable);
             }
@@ -188,7 +237,7 @@ impl Plugin for OxrInitPlugin {
 fn detect_session_destroyed(
     mut last_state: Local<bool>,
     state: Res<XrDestroySessionRender>,
-    mut sender: EventWriter<XrSessionDestroyedEvent>,
+    mut sender: MessageWriter<XrSessionDestroyedMessage>,
     mut cmds: Commands,
 ) {
     let state = state.0.load(Ordering::Relaxed);
@@ -203,6 +252,7 @@ fn detect_session_destroyed(
 impl OxrInitPlugin {
     fn init_xr(
         &self,
+        cfg: Option<&OxrManualGraphicsConfig>,
     ) -> OxrResult<(
         OxrInstance,
         OxrSystemId,
@@ -222,7 +272,7 @@ impl OxrInitPlugin {
 
         // check available extensions and send a warning for any wanted extensions that aren't available.
         for ext in available_exts.unavailable_exts(&self.exts) {
-            error!(
+            warn!(
                 "Extension \"{ext}\" not available in the current OpenXR runtime. Disabling extension."
             );
         }
@@ -246,13 +296,7 @@ impl OxrInitPlugin {
 
         let exts = self.exts.clone() & available_exts;
 
-        let instance = entry.create_instance(
-            self.app_info.clone(),
-            exts.clone(),
-            // &["XR_APILAYER_LUNARG_api_dump"],
-            &[],
-            backend,
-        )?;
+        let instance = entry.create_instance(self.app_info.clone(), exts.clone(), &[], backend)?;
         let instance_props = instance.properties()?;
 
         info!(
@@ -272,7 +316,7 @@ impl OxrInitPlugin {
             }
         );
 
-        let (graphics, graphics_info) = instance.init_graphics(system_id)?;
+        let (graphics, graphics_info) = instance.init_graphics(system_id, cfg)?;
 
         Ok((
             instance,
@@ -283,14 +327,11 @@ impl OxrInitPlugin {
         ))
     }
 }
-#[derive(Event, Clone, Copy, Debug, Default)]
-pub struct OxrInteractionProfileChanged;
 
 pub fn handle_events(
     event: OxrEventIn,
     mut status: ResMut<XrState>,
-    mut changed_event: EventWriter<XrStateChanged>,
-    mut interaction_profile_changed_event: EventWriter<OxrInteractionProfileChanged>,
+    mut changed_event: MessageWriter<XrStateChanged>,
 ) {
     use openxr::Event::*;
     match *event {
@@ -321,10 +362,6 @@ pub fn handle_events(
         }
         InstanceLossPending(_) => {}
         EventsLost(e) => warn!("lost {} XR events", e.lost_event_count()),
-        // we might want to check if this is the correct session?
-        Event::InteractionProfileChanged(_) => {
-            interaction_profile_changed_event.write_default();
-        }
         _ => {}
     }
 }
@@ -335,7 +372,7 @@ fn init_xr_session(
     system_id: openxr::SystemId,
     chain: &mut OxrSessionCreateNextChain,
     OxrSessionConfig {
-        blend_modes,
+        blend_mode_preference,
         formats,
         resolutions,
     }: OxrSessionConfig,
@@ -347,6 +384,7 @@ fn init_xr_session(
     OxrSwapchain,
     OxrSwapchainImages,
     OxrCurrentSessionConfig,
+    OxrEnvironmentBlendModes,
 )> {
     let (session, frame_waiter, frame_stream) =
         unsafe { instance.create_session(system_id, graphics_info, chain)? };
@@ -434,25 +472,10 @@ fn init_xr_session(
         instance.enumerate_environment_blend_modes(system_id, view_configuration_type)?;
 
     // blend mode selection
-    let blend_mode = if let Some(wanted_blend_modes) = &blend_modes {
-        let mut blend_mode = None;
-        for wanted_blend_mode in wanted_blend_modes {
-            if available_blend_modes.contains(wanted_blend_mode) {
-                blend_mode = Some(*wanted_blend_mode);
-                break;
-            }
-        }
-        blend_mode
-    } else {
-        available_blend_modes.first().copied()
-    }
-    .ok_or(OxrError::NoAvailableBlendMode)?;
+    let blend_modes = OxrEnvironmentBlendModes::new(available_blend_modes, &blend_mode_preference)
+        .ok_or(OxrError::NoAvailableBlendMode)?;
 
-    let graphics_info = OxrCurrentSessionConfig {
-        blend_mode,
-        resolution,
-        format,
-    };
+    let graphics_info = OxrCurrentSessionConfig { resolution, format };
 
     Ok((
         session,
@@ -461,6 +484,7 @@ fn init_xr_session(
         swapchain,
         images,
         graphics_info,
+        blend_modes,
     ))
 }
 
@@ -481,7 +505,15 @@ pub fn create_xr_session(world: &mut World) {
         session_config.clone(),
         session_create_info.clone(),
     ) {
-        Ok((session, frame_waiter, frame_stream, swapchain, images, graphics_info)) => {
+        Ok((
+            session,
+            frame_waiter,
+            frame_stream,
+            swapchain,
+            images,
+            graphics_info,
+            blend_modes,
+        )) => {
             world.insert_resource(session.clone());
             world.insert_resource(frame_waiter);
             world.insert_resource(images);
@@ -497,12 +529,13 @@ pub fn create_xr_session(world: &mut World) {
                     .expect("added by xr session plugin")
                     .clone(),
             });
+            world.insert_resource(blend_modes);
         }
         Err(e) => error!("Failed to initialize XrSession: {e}"),
     }
     world.insert_non_send_resource(chain);
     world.run_schedule(XrSessionCreated);
-    world.send_event(XrSessionCreatedEvent);
+    world.write_message(XrSessionCreatedMessage);
 }
 
 pub fn destroy_xr_session(world: &mut World) {
@@ -516,10 +549,7 @@ pub fn destroy_xr_session(world: &mut World) {
     world.insert_resource(XrState::Available);
 }
 
-pub fn begin_xr_session(
-    world: &mut World,
-    // session: Res<OxrSession>, mut session_started: ResMut<OxrSessionStarted>
-) {
+pub fn begin_xr_session(world: &mut World) {
     let _span = debug_span!("xr_begin_session").entered();
     world
         .get_resource::<OxrSession>()
@@ -531,11 +561,7 @@ pub fn begin_xr_session(
     world.run_schedule(XrPostSessionBegin);
 }
 
-pub fn end_xr_session(
-    world: &mut World,
-    // session: Res<OxrSession>, mut session_started: ResMut<OxrSessionStarted>
-) {
-    // Maybe this could be an event?
+pub fn end_xr_session(world: &mut World) {
     world.run_schedule(XrPreSessionEnd);
     let _span = debug_span!("xr_end_session").entered();
     world

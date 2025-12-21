@@ -1,17 +1,21 @@
-//! A simple 3D scene with light shining over a cube sitting on a plane.
-
-use bevy::{prelude::*, render::pipelined_rendering::PipelinedRenderingPlugin};
-use bevy_mod_openxr::{add_xr_plugins, resources::OxrSessionConfig};
+use bevy::prelude::*;
+use bevy_mod_openxr::{add_xr_plugins, exts::OxrExtensions, init::OxrInitPlugin, resources::OxrSessionConfig};
+use bevy_mod_xr::hand_debug_gizmos::HandGizmosPlugin;
+use bevy_xr_utils::{
+    generic_tracker::GenericTrackerGizmoPlugin, mndx_xdev_spaces_trackers::MonadoXDevSpacesPlugin,
+};
 use openxr::EnvironmentBlendMode;
-
 fn main() -> AppExit {
     App::new()
-        .add_plugins(add_xr_plugins(
-            // Disabling Pipelined Rendering should reduce latency a little bit for button inputs
-            // and increase accuracy for hand tracking, controller positions and similar,
-            // the views are updated right before rendering so they are as accurate as possible
-            DefaultPlugins.build().disable::<PipelinedRenderingPlugin>(),
-        ))
+        .add_plugins(add_xr_plugins(DefaultPlugins).set(OxrInitPlugin {
+            exts: {
+                let mut exts = OxrExtensions::default();
+                exts.enable_hand_tracking();
+                exts.other.push("XR_MNDX_xdev_space".to_string());
+                exts
+            },
+            ..Default::default()
+        }))
         .insert_resource(OxrSessionConfig {
             blend_mode_preference: vec![
                 EnvironmentBlendMode::ALPHA_BLEND,
@@ -20,9 +24,13 @@ fn main() -> AppExit {
             ],
             ..default()
         })
-        .add_plugins(bevy_mod_xr::hand_debug_gizmos::HandGizmosPlugin)
-        .add_systems(Startup, setup)
         .insert_resource(ClearColor(Color::NONE))
+        .add_plugins((
+            HandGizmosPlugin,
+            GenericTrackerGizmoPlugin,
+            MonadoXDevSpacesPlugin,
+        ))
+        .add_systems(Startup, setup)
         .run()
 }
 

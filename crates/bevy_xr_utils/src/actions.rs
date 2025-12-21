@@ -53,7 +53,9 @@
 //!     }
 //!
 //!
-use bevy::prelude::*;
+use bevy_app::{App, Plugin, PreUpdate, Startup, Update};
+use bevy_ecs::{component::Component, entity::Entity, hierarchy::Children, message::MessageWriter, query::With, schedule::{IntoScheduleConfigs as _, SystemSet}, system::{Commands, Query, Res, ResMut}};
+use bevy_log::info;
 use bevy_mod_openxr::{
     action_binding::OxrSuggestActionBinding,
     action_set_attaching::OxrAttachActionSet,
@@ -71,16 +73,16 @@ impl Plugin for XRUtilsActionsPlugin {
     fn build(&self, app: &mut App) {
         app.configure_sets(
             Startup,
-            XRUtilsActionSystemSet::CreateEvents.run_if(openxr_session_available),
+            XRUtilsActionSystems::CreateEvents.run_if(openxr_session_available),
         );
         app.configure_sets(
             PreUpdate,
-            XRUtilsActionSystemSet::SyncActionStates.run_if(openxr_session_running),
+            XRUtilsActionSystems::SyncActionStates.run_if(openxr_session_running),
         );
         app.add_systems(
             Startup,
             create_openxr_events
-                .in_set(XRUtilsActionSystemSet::CreateEvents)
+                .in_set(XRUtilsActionSystems::CreateEvents)
                 .run_if(openxr_session_available),
         );
         app.add_systems(
@@ -91,21 +93,21 @@ impl Plugin for XRUtilsActionsPlugin {
             PreUpdate,
             sync_and_update_action_states_f32
                 .run_if(openxr_session_running)
-                .in_set(XRUtilsActionSystemSet::SyncActionStates)
+                .in_set(XRUtilsActionSystems::SyncActionStates)
                 .after(OxrActionSetSyncSet),
         );
         app.add_systems(
             PreUpdate,
             sync_and_update_action_states_bool
                 .run_if(openxr_session_running)
-                .in_set(XRUtilsActionSystemSet::SyncActionStates)
+                .in_set(XRUtilsActionSystems::SyncActionStates)
                 .after(OxrActionSetSyncSet),
         );
         app.add_systems(
             PreUpdate,
             sync_and_update_action_states_vector
                 .run_if(openxr_session_running)
-                .in_set(XRUtilsActionSystemSet::SyncActionStates)
+                .in_set(XRUtilsActionSystems::SyncActionStates)
                 .after(OxrActionSetSyncSet),
         );
     }
@@ -116,8 +118,8 @@ fn create_openxr_events(
     actions_query: Query<(&XRUtilsAction, &Children)>,
     bindings_query: Query<&XRUtilsBinding>,
     instance: ResMut<OxrInstance>,
-    mut binding_writer: EventWriter<OxrSuggestActionBinding>,
-    mut attach_writer: EventWriter<OxrAttachActionSet>,
+    mut binding_writer: MessageWriter<OxrSuggestActionBinding>,
+    mut attach_writer: MessageWriter<OxrAttachActionSet>,
     mut commands: Commands,
 ) {
     //lets create some sets!
@@ -131,12 +133,12 @@ fn create_openxr_events(
         commands.entity(id).insert(oxr_action_set);
 
         //since the actions are made from the sets lets go
-        for child in children.iter() {
+        for child in children.iter().copied() {
             //first get the action entity and stuff
             let (create_action, bindings) = actions_query.get(child).unwrap();
             //lets create dat action
             match create_action.action_type {
-                bevy_mod_xr::actions::ActionType::Bool => {
+                ActionType::Bool => {
                     let action: openxr::Action<bool> = action_set
                         .create_action::<bool>(
                             &create_action.action_name,
@@ -158,7 +160,7 @@ fn create_openxr_events(
                         }),
                     ));
                     //since we need actions for bindings lets go!!
-                    for bind in bindings.iter() {
+                    for bind in bindings.iter().copied() {
                         //interaction profile
                         //get the binding entity and stuff
                         let create_binding = bindings_query.get(bind).unwrap();
@@ -174,7 +176,7 @@ fn create_openxr_events(
                         binding_writer.write(sugestion);
                     }
                 }
-                bevy_mod_xr::actions::ActionType::Float => {
+                ActionType::Float => {
                     let action: openxr::Action<f32> = action_set
                         .create_action::<f32>(
                             &create_action.action_name,
@@ -197,7 +199,7 @@ fn create_openxr_events(
                         }),
                     ));
                     //since we need actions for bindings lets go!!
-                    for bind in bindings.iter() {
+                    for bind in bindings.iter().copied() {
                         //interaction profile
                         //get the binding entity and stuff
                         let create_binding = bindings_query.get(bind).unwrap();
@@ -213,7 +215,7 @@ fn create_openxr_events(
                         binding_writer.write(sugestion);
                     }
                 }
-                bevy_mod_xr::actions::ActionType::Vector => {
+                ActionType::Vector => {
                     let action: openxr::Action<Vector2f> = action_set
                         .create_action::<Vector2f>(
                             &create_action.action_name,
@@ -236,7 +238,7 @@ fn create_openxr_events(
                         }),
                     ));
                     //since we need actions for bindings lets go!!
-                    for bind in bindings.iter() {
+                    for bind in bindings.iter().copied() {
                         //interaction profile
                         //get the binding entity and stuff
                         let create_binding = bindings_query.get(bind).unwrap();
@@ -260,7 +262,7 @@ fn create_openxr_events(
 }
 
 fn sync_active_action_sets(
-    mut sync_set: EventWriter<OxrSyncActionSet>,
+    mut sync_set: MessageWriter<OxrSyncActionSet>,
     active_action_set_query: Query<&XRUtilsActionSetReference, With<ActiveSet>>,
 ) {
     for set in &active_action_set_query {
@@ -343,8 +345,15 @@ fn sync_and_update_action_states_vector(
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub enum ActionType {
+    Bool,
+    Float,
+    Vector,
+}
+
 #[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, SystemSet)]
-pub enum XRUtilsActionSystemSet {
+pub enum XRUtilsActionSystems {
     /// Runs in Startup
     CreateEvents,
     /// Runs in PreUpdate
@@ -373,7 +382,7 @@ pub struct ActiveSet;
 pub struct XRUtilsAction {
     pub action_name: Cow<'static, str>,
     pub localized_name: Cow<'static, str>,
-    pub action_type: bevy_mod_xr::actions::ActionType,
+    pub action_type: ActionType,
 }
 
 #[derive(Component)]
