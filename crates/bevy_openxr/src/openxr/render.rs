@@ -7,24 +7,24 @@ use bevy_ecs::{
     system::{Commands, Query, Res, ResMut},
     world::World,
 };
-use bevy_log::{debug_span, error, info};
+use bevy_log::{debug_span, error, info, warn};
 use bevy_render::{
+    Render, RenderApp,
     extract_resource::ExtractResourcePlugin,
     pipelined_rendering::PipelinedRenderingPlugin,
     texture::{ManualTextureView, ManualTextureViews},
     view::ExtractedView,
-    Render, RenderApp,
 };
 
 use bevy_mod_xr::{
-    camera::{calculate_projection, Fov, XrCamera, XrProjection, XrViewInit},
+    camera::{Fov, XrCamera, XrProjection, XrViewInit, calculate_projection},
     session::{
         XrFirst, XrHandleEvents, XrPreDestroySession, XrRenderSystems, XrRootTransform,
         XrSessionCreated,
     },
     spaces::XrPrimaryReferenceSpace,
 };
-use bevy_transform::{components::Transform, TransformSystems};
+use bevy_transform::{TransformSystems, components::Transform};
 use openxr::ViewStateFlags;
 
 use crate::{helper_traits::ToTransform as _, init::should_run_frame_loop, resources::*};
@@ -158,10 +158,7 @@ pub fn init_views<const SPAWN_CAMERAS: bool>(
             add_texture_view(&mut manual_texture_views, temp_tex, &graphics_info, index);
         if SPAWN_CAMERAS {
             commands.spawn((
-                Camera {
-                    target: RenderTarget::TextureView(view_handle),
-                    ..Default::default()
-                },
+                RenderTarget::TextureView(view_handle),
                 XrCamera(index),
                 Projection::custom(XrProjection::default()),
                 // NoFrustumCulling,
@@ -177,14 +174,14 @@ pub fn wait_frame(mut frame_waiter: ResMut<OxrFrameWaiter>, mut commands: Comman
 
 pub fn update_cameras(
     frame_state: Res<OxrFrameState>,
-    mut cameras: Query<(&mut Camera, &XrCamera)>,
+    mut cameras: Query<(&mut Camera, &mut RenderTarget, &XrCamera)>,
 ) {
-    for (mut camera, xr_camera) in &mut cameras {
-        camera.target =
+    for (_, mut target, xr_camera) in &mut cameras {
+        *target =
             RenderTarget::TextureView(ManualTextureViewHandle(XR_TEXTURE_INDEX + xr_camera.0));
     }
     if frame_state.is_changed() {
-        for (mut camera, _) in &mut cameras {
+        for (mut camera, _, _) in &mut cameras {
             camera.is_active = frame_state.should_render
         }
     }
@@ -205,13 +202,16 @@ pub fn locate_views(
     } else {
         frame_state.predicted_display_time
     };
-    let (flags, xr_views) = session
+    let Ok((flags, xr_views)) = session
         .locate_views(
             openxr::ViewConfigurationType::PRIMARY_STEREO,
             time,
             &ref_space,
         )
-        .expect("Failed to locate views");
+        .inspect_err(|err| warn!("failed to locate views: {err}"))
+    else {
+        return;
+    };
 
     match (
         flags & ViewStateFlags::ORIENTATION_VALID == ViewStateFlags::ORIENTATION_VALID,
@@ -286,7 +286,11 @@ pub fn insert_texture_views(
     mut swapchain: ResMut<OxrSwapchain>,
     mut manual_texture_views: ResMut<ManualTextureViews>,
     graphics_info: Res<OxrCurrentSessionConfig>,
+    frame_state: Res<OxrFrameState>,
 ) {
+    if !frame_state.should_render {
+        return;
+    }
     let index = swapchain.acquire_image().expect("Failed to acquire image");
     let image = &swapchain_images[index as usize];
 
@@ -296,10 +300,12 @@ pub fn insert_texture_views(
     }
 }
 
-pub fn wait_image(mut swapchain: ResMut<OxrSwapchain>) {
-    swapchain
-        .wait_image(openxr::Duration::INFINITE)
-        .expect("Failed to wait image");
+pub fn wait_image(mut swapchain: ResMut<OxrSwapchain>, state: Res<OxrFrameState>) {
+    if state.should_render {
+        swapchain
+            .wait_image(openxr::Duration::INFINITE)
+            .expect("Failed to wait image");
+    }
 }
 
 pub fn add_texture_view(
@@ -317,7 +323,7 @@ pub fn add_texture_view(
     let view = ManualTextureView {
         texture_view: view.into(),
         size: info.resolution,
-        format: info.format,
+        view_format: info.format,
     };
     let handle = ManualTextureViewHandle(XR_TEXTURE_INDEX + index);
     manual_texture_views.insert(handle, view);
@@ -328,7 +334,10 @@ pub fn begin_frame(mut frame_stream: ResMut<OxrFrameStream>) {
     frame_stream.begin().expect("Failed to begin frame");
 }
 
-pub fn release_image(mut swapchain: ResMut<OxrSwapchain>) {
+pub fn release_image(mut swapchain: ResMut<OxrSwapchain>, state: Res<OxrFrameState>) {
+    if !state.should_render {
+        return;
+    }
     #[cfg(target_os = "android")]
     {
         let ctx = ndk_context::android_context();
